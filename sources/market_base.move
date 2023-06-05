@@ -19,9 +19,8 @@ module perp::market_base {
     const ENoPositionOpen: u64 = 8;
     const EPriceImpactToleranceExceeded: u64 = 9;
 
-    public(friend) fun asset_price_require_system_checks<B, Q>(_market: &Market<B, Q>): u64 {
-        //let base_asset = market_manager::base_asset<B, Q>(market);
-        let (rate, _broken, _valid) = exchange_rates::rate_with_safety_checks<B, Q>();
+    public fun asset_price_require_system_checks<B, Q>(market: &Market<B, Q>): u64 {
+        let (rate, _broken, _valid) = exchange_rates::rate_with_safety_checks<B, Q>(market);
         // TODO: check broken/valid
         rate
     }
@@ -101,7 +100,7 @@ module perp::market_base {
      * Returns price at which a trade is executed. If the size contracts the skew, then a discount
      * is applied on the price, whereas expanding the skew incurs an additional premium.
      */
-    public(friend) fun fill_price<B, Q>(market: &Market<B, Q>, size: u64, size_direction: bool, price: u64): u64 {
+    public fun fill_price<B, Q>(market: &Market<B, Q>, size: u64, size_direction: bool, price: u64): u64 {
         let (skew, skew_direction) = market_manager::market_skew<B, Q>(market);
         let skew_scale = market_manager::skew_scale<B, Q>(market);
         // TODO: do anything with new_skew_direction here?
@@ -174,7 +173,8 @@ module perp::market_base {
             // Send the fee to the vault
             // The fee has already been subtracted out of the user's position margin, so they can't access it anymore,
             // we are just shuffling numbers around in the vault
-            market_manager::pay_fee<B, Q>(market, fee);
+            let vault = market_manager::get_vault_mut<B, Q>(market);
+            market_manager::add_to_cumulative_rewards<Q>(fee, vault);
             // TODO: emit event
         };
 
@@ -183,7 +183,7 @@ module perp::market_base {
             market,
             new_pos_lfi, // new position parameters
             new_pos_margin,
-            fill_price,
+            oracle_price, // TODO: why does synthetix use fill price here?
             new_pos_size,
             old_pos_lfi, // old position parameters
             old_pos_margin,
@@ -205,6 +205,39 @@ module perp::market_base {
         );
 
         // TODO: emit the position modified event
+    }
+
+    public(friend) fun accessible_margin<B, Q>(
+        market: &Market<B, Q>,
+        price: u64,
+        msg_sender: address,
+        timestamp_ms: u64
+    ): u64 {
+        // Ugly solution to rounding safety: leave up to an extra tenth of a cent in the account/leverage
+        // This should guarantee that the value returned here can always be withdrawn, but there may be
+        // a little extra actually-accessible value left over, depending on the position size and margin.
+        let milli = ONE_UNIT / 1000;
+        let max_leverage = market_manager::max_leverage<B, Q>(market) - milli;
+        let (_, _, _, pos_size, pos_direction) = market_manager::get_position_data<B, Q>(market, msg_sender);
+        let (notional, _) = notional_value(pos_size, pos_direction, price);
+
+        // If the user has a position open, we'll enforce a min initial margin requirement.
+        let inaccessible = utils::divide_decimal(notional, max_leverage);
+        if (inaccessible > 0) {
+            let min_initial_margin = market_manager::min_initial_margin<B, Q>(market);
+            if (inaccessible < min_initial_margin) {
+                inaccessible = min_initial_margin;
+            };
+
+            inaccessible = inaccessible + milli;
+        };
+
+        let remaining = margin_plus_profit_funding<B, Q>(market, price, msg_sender, timestamp_ms);
+        if (remaining <= inaccessible) {
+            0
+        } else {
+            utils::sub(remaining, inaccessible)
+        }
     }
 
     fun assert_price_impact(
@@ -389,7 +422,7 @@ module perp::market_base {
         false
     }
 
-    fun order_fee(
+    public fun order_fee(
         skew: u64,
         skew_direction: bool,
         size_delta: u64,
@@ -448,7 +481,7 @@ module perp::market_base {
     }
 
     fun remaining_liquidatable_margin<B, Q>(market: &Market<B, Q>, price: u64, position_size: u64, msg_sender: address, timestamp_ms: u64): u64 {
-        let (margin, _) = margin_plus_profit_funding<B, Q>(market, price, msg_sender, timestamp_ms);
+        let margin = margin_plus_profit_funding<B, Q>(market, price, msg_sender, timestamp_ms);
         let liq_premium = liquidation_premium<B, Q>(market, position_size, price);
         utils::sub(margin, liq_premium)
     }
@@ -539,7 +572,7 @@ module perp::market_base {
         proportional_elapsed
     }
 
-    fun next_funding_entry<B, Q>(market: &Market<B, Q>, price: u64, timestamp_ms: u64): (u64, bool) {
+    public fun next_funding_entry<B, Q>(market: &Market<B, Q>, price: u64, timestamp_ms: u64): (u64, bool) {
         let latest_funding_index = market_manager::latest_funding_index<B, Q>(market);
         let (latest_funding, latest_funding_direction) = market_manager::funding_sequence<B, Q>(market, latest_funding_index);
         let (unrecorded_funding, unrecorded_funding_direction) = unrecorded_funding<B, Q>(market, price, timestamp_ms);
@@ -547,7 +580,7 @@ module perp::market_base {
         utils::add_signed(latest_funding, latest_funding_direction, unrecorded_funding, unrecorded_funding_direction)
     }
 
-    fun unrecorded_funding<B, Q>(market: &Market<B, Q>, price: u64, timestamp_ms: u64): (u64, bool) {
+    public fun unrecorded_funding<B, Q>(market: &Market<B, Q>, price: u64, timestamp_ms: u64): (u64, bool) {
         let (next_funding, next_funding_direction) = current_funding_rate<B, Q>(market, timestamp_ms);
         let (last_funding, last_funding_direction) = market_manager::funding_rate_last_recomputed<B, Q>(market);
         let (funding, funding_direction) = utils::add_signed(next_funding, next_funding_direction, last_funding, last_funding_direction);
@@ -569,11 +602,17 @@ module perp::market_base {
         old_last_price: u64,
         old_size: u64,
     ) {
-        let new_correction = position_debt_correction<B, Q>(market, new_last_funding_index, new_margin, new_last_price, new_size);
-        let old_correction = position_debt_correction<B, Q>(market, old_last_funding_index, old_margin, old_last_price, old_size);
-        let current_edc = market_manager::entry_debt_correction<B, Q>(market);
-        let entry_debt_correction = current_edc + utils::sub(new_correction, old_correction);
-        market_manager::set_entry_debt_correction<B, Q>(market, entry_debt_correction);
+        let (new_correction, new_correction_direction) = position_debt_correction<B, Q>(market, new_last_funding_index, new_margin, new_last_price, new_size);
+        let (old_correction, old_correction_direction) = position_debt_correction<B, Q>(market, old_last_funding_index, old_margin, old_last_price, old_size);
+        let (current_edc, current_edc_direction) = market_manager::entry_debt_correction<B, Q>(market);
+        let (current_plus_new_edc, current_plus_new_edc_direction) = utils::add_signed(current_edc, current_edc_direction, new_correction, new_correction_direction);
+        let (entry_debt_correction, edc_direction) = utils::subtract_signed(
+            current_plus_new_edc,
+            current_plus_new_edc_direction,
+            old_correction,
+            old_correction_direction
+        );
+        market_manager::set_entry_debt_correction<B, Q>(market, entry_debt_correction, edc_direction);
     }
 
     /*
@@ -585,7 +624,7 @@ module perp::market_base {
         position_margin: u64,
         position_last_price: u64,
         position_size: u64,
-    ): u64 {
+    ): (u64, bool) {
         /*
             The overall market debt is the sum of the remaining margin in all positions. The intuition is that
             the debt of a single position is the value withdrawn upon closing that position.
@@ -607,13 +646,14 @@ module perp::market_base {
         */
         let (funding, funding_direction) = market_manager::funding_sequence<B, Q>(market, position_last_funding_index);
         // price always positive
-        let (price_plus_funding, _) = utils::add_signed(position_last_price, true, funding, funding_direction);
-        let position_debt_correction = utils::sub(
+        let (price_plus_funding, ppf_direction) = utils::add_signed(position_last_price, true, funding, funding_direction);
+        let (position_debt_correction, pdc_direction) = utils::subtract_signed(
             position_margin,
-            utils::multiply_decimal(position_size, price_plus_funding)
+            true, // margin always positive
+            utils::multiply_decimal(position_size, price_plus_funding),
+            ppf_direction
         );
-        // TODO: do we need to take position_direction in here? We are looking at size?
-        position_debt_correction
+        (position_debt_correction, pdc_direction)
     }
 
     fun recompute_margin_with_delta<B, Q>(
@@ -624,11 +664,12 @@ module perp::market_base {
         msg_sender: address,
         timestamp_ms: u64
     ): u64 {
-        let (new_margin, pos_direction) = margin_plus_profit_funding<B, Q>(market, price, msg_sender, timestamp_ms);
-        let (new_margin, new_position_direction) = utils::add_signed(new_margin, pos_direction, margin_delta, margin_delta_direction);
+        let curr_margin = margin_plus_profit_funding<B, Q>(market, price, msg_sender, timestamp_ms);
+        // 2nd argument true. margin always positive (or 0)
+        let (new_margin, new_position_direction) = utils::add_signed(curr_margin, true, margin_delta, margin_delta_direction);
 
-        // make sure new margin greater than 0
-        assert!(new_margin > 0 && new_position_direction, EInsufficientMargin);
+        // make sure new margin is not negative
+        assert!(new_margin >= 0 && new_position_direction, EInsufficientMargin);
         let (_, _, _, position_size, _) = market_manager::get_position_data<B, Q>(market, msg_sender);
         let liq_margin = liquidation_margin<B, Q>(market, position_size, price);
         // make sure new position can't be liquidated (size 0 can't be liquidated)
@@ -638,48 +679,60 @@ module perp::market_base {
     }
 
     // return position margin and direction
-    fun margin_plus_profit_funding<B, Q>(
+    public fun margin_plus_profit_funding<B, Q>(
         market: &Market<B, Q>,
         price: u64,
         msg_sender: address,
         timestamp_ms: u64
-    ): (u64, bool) {
+    ): u64 {
         let (_, position_margin, _, _, position_direction) = market_manager::get_position_data<B, Q>(market, msg_sender);
         let (funding, funding_direction) = accrued_funding<B, Q>(market, price, msg_sender, timestamp_ms);
         let (pnl, pnl_direction) = profit_loss<B, Q>(market, price, msg_sender);
         // margin + funding
         let (pos_plus_funding, pos_plus_funding_direction) = utils::add_signed(position_margin, position_direction, funding, funding_direction);
         // margin + funding + pnl
-        utils::add_signed(pos_plus_funding, pos_plus_funding_direction, pnl, pnl_direction)
+        let (margin, margin_direction) = utils::add_signed(pos_plus_funding, pos_plus_funding_direction, pnl, pnl_direction);
+        if (margin_direction) {
+            margin
+        } else {
+            // margin can't go negative, return 0
+            0
+        }
     }
 
     /**
      * Returns pnl for given position and price: (profit, pnl_direction)
      * - if long and price is higher, pnl increases, so return (pnl, true)
      * - if long and price is lower, pnl decreases so return (pnl, false)
-     * - if short and price is higher, pnl decreases so return (pnl, true)
-     * - if short and price is lower, pnl increases so return (pnl, false)
+     * - if short and price is higher, pnl decreases so return (pnl, false)
+     * - if short and price is lower, pnl increases so return (pnl, true)
      */
-    fun profit_loss<B, Q>(
+    public fun profit_loss<B, Q>(
         market: &Market<B, Q>,
         price: u64,
         msg_sender: address
     ): (u64, bool) {
-        let (_, _, position_last_price, position_size, _) = market_manager::get_position_data<B, Q>(market, msg_sender);
+        let (_, _, position_last_price, position_size, position_direction) = market_manager::get_position_data<B, Q>(market, msg_sender);
         if (price > position_last_price) {
             // price has increased
             let price_shift = utils::sub(price, position_last_price);
             let pnl = utils::multiply_decimal(position_size, price_shift);
             // pnl increased if long, or decreased if short
-            // true for long means profit went up, false for short means profit went down
-            (pnl, true)
+            if (position_direction) {
+                (pnl, true)
+            } else {
+                (pnl, false)
+            }
         } else {
             // price has decreased
             let price_shift = utils::sub(position_last_price, price);
             let pnl = utils::multiply_decimal(position_size, price_shift);
             // pnl decreased if long, or increased if short
-            // false for long means profit went down, false for short means profit went up
-            (pnl, false)
+            if (position_direction) {
+                (pnl, false)
+            } else {
+                (pnl, true)
+            }
         }
     }
 
@@ -719,7 +772,7 @@ module perp::market_base {
         utils::subtract_signed(next_funding, next_funding_direction, start_funding, start_funding_direction)
     }
 
-    fun current_leverage(
+    public fun current_leverage(
         position_size: u64,
         price: u64,
         remaining_margin: u64
@@ -787,6 +840,36 @@ module perp::market_base {
         } else {
             capped_proportional_fee
         }
+    }
+
+    /**
+     * The debt contributed by this market to the overall system.
+     * The total market debt is equivalent to the sum of remaining margins in all open positions.
+     */
+    public fun market_debt<B, Q>(
+        market: &Market<B, Q>,
+        timestamp_ms: u64
+    ): u64 {
+        let price = asset_price_require_system_checks<B, Q>(market);
+        //let (skew, skew_direction) = market_manager::market_skew<B, Q>(market);
+        let size = market_manager::market_size<B, Q>(market);
+        let (edc, edc_direction) = market_manager::entry_debt_correction<B, Q>(market);
+        if (size == 0 && edc == 0) {
+            // if these are 0, the resulting calculation is necessarily zero as well
+            return 0
+        };
+
+        let (funding, funding_direction) = next_funding_entry<B, Q>(market, price, timestamp_ms);
+        let (price_with_funding, pwf_direction) = utils::add_signed(price, true, funding, funding_direction);
+        let (size_times_pwf, size_times_pwf_direction) = utils::multiply_decimal_signed(size, true, price_with_funding, pwf_direction);
+
+        let (total_debt, total_debt_direction) = utils::add_signed(size_times_pwf, size_times_pwf_direction, edc, edc_direction);
+        // debt can't be negative
+        // TODO: verify this?
+        if (!total_debt_direction) {
+            return 0
+        };
+        total_debt
     }
 
 }

@@ -1,13 +1,19 @@
 module perp::utils {
 
-    const ONE_UNIT: u64 = 1_000_000_000;
+    const ONE_UNIT: u256 = 1_000_000_000;
 
     public fun divide_decimal(x: u64, y: u64): u64 {
-        (x / y) * ONE_UNIT
+        let x_256: u256 = (x as u256);
+        let y_256: u256 = (y as u256);
+        let div: u256 = (x_256 * ONE_UNIT) / y_256;
+        (div as u64)
     }
 
     public fun multiply_decimal(x: u64, y: u64): u64 {
-        (x / ONE_UNIT) * y
+        let x_256: u256 = (x as u256);
+        let y_256: u256 = (y as u256);
+        let mul: u256 = (x_256 * y_256) / ONE_UNIT;
+        (mul as u64)
     }
 
     /**
@@ -79,6 +85,17 @@ module perp::utils {
         // should never reach this
         assert!(false, 0);
         (0, true)
+    }
+
+    public fun multiply_decimal_signed(x: u64, x_dir: bool, y: u64, y_dir: bool): (u64, bool) {
+        let direction = if ((x_dir && y_dir) || (!x_dir && !y_dir)) {
+            true
+        } else {
+            false
+        };
+
+        let mul = multiply_decimal(x, y);
+        (mul, direction)
     }
 
     // True if and only if two positions a and b are on the same side of the market;

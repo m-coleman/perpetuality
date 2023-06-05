@@ -18,9 +18,12 @@ module perp::market_manager {
     friend perp::market;
     friend perp::market_base;
     friend perp::vault;
+    friend perp::exchange_rates;
+    friend perp::market_views; // TODO: remove this
 
     const EMarketAlreadyExists: u64 = 0;
     const EMarketDoesNotExist: u64 = 1;
+    const ONE_UNIT: u64 = 1_000_000_000;
 
     // owner capability
     struct OwnerCap has key, store {
@@ -46,13 +49,14 @@ module perp::market_manager {
     }
 
     struct Vault<phantom Q> has store {
-        funds: Balance<Q>, // Total amount of funds in the vault. Includes trader's margin and staker's balance
+        funds: Balance<Q>, // Total amount of funds in the vault. Includes trader's margin, staker's balance, and fees collected
         shares: u64, // Total ownership shares
         cumulative_reward_per_share: u64,
         fees_outstanding: u64,
         stakes : Table<address, Stake>,
         rewards: Table<address, RewardInfo>,
         can_user_stake: bool,
+        utilization_mutliplier: u64,
         max_capacity: u64, // Maximum capacity
         staking_period: u64 // Time required to lock stake (seconds)
     }
@@ -60,7 +64,8 @@ module perp::market_manager {
     struct Market<phantom B, phantom Q> has store {
         market_settings: MarketSettings,
         market_state: MarketState<B, Q>,
-        vault: Vault<Q>
+        vault: Vault<Q>,
+        oracle: Oracle<B>
     }
 
     struct MarketSettings has store {
@@ -90,6 +95,7 @@ module perp::market_manager {
         * which is equivalent to the sum of remaining margins in all positions.
         */
         entry_debt_correction: u64,
+        entry_debt_correction_direction: bool,
         funding_last_recomputed: u64, //timestamp
         funding_sequence: vector<FundingEntry>,
         funding_rate_last_recomputed: FundingEntry,
@@ -108,6 +114,10 @@ module perp::market_manager {
         last_price: u64,
         size: u64,
         direction: bool
+    }
+
+    struct Oracle<phantom B> has store {
+        price: u64
     }
 
     fun init(ctx: &mut TxContext) {
@@ -199,26 +209,20 @@ module perp::market_manager {
     }
 
     /**
-     * Sizes of the long and short sides of the market
+     * Sizes of the long and short sides of the market. ex:
+     * size = 10, skew = 2 false => 4 long 6 short
+     * size = 10, skew = 2 true => 6 long 4 short
      */
     public fun market_sizes<B, Q>(market: &Market<B, Q>): (u64, u64) {
         let size = market_size<B, Q>(market);
         let (skew, skew_direction) = market_skew<B, Q>(market);
-        // size = 10, skew = 2 false => 4 long 6 short
-        // size = 10, skew = 2 true => 6 long 4 short
-        if (skew_direction) {
-            let (l, _) = utils::add_signed(size, true, skew, skew_direction);
-            let (s, _) = utils::subtract_signed(size, true, skew, skew_direction);
-            (l / 2, s / 2)
-        } else {
-            let (l, _) = utils::subtract_signed(size, true, skew, skew_direction);
-            let (s, _) = utils::add_signed(size, true, skew, skew_direction);
-            (l / 2, s / 2)
-        }
+        let (l, _) = utils::add_signed(size, true, skew, skew_direction);
+        let (s, _) = utils::subtract_signed(size, true, skew, skew_direction);
+        (l / 2, s / 2)
     }
 
-    public fun entry_debt_correction<B, Q>(market: &Market<B, Q>): u64 {
-        market.market_state.entry_debt_correction
+    public fun entry_debt_correction<B, Q>(market: &Market<B, Q>): (u64, bool) {
+        (market.market_state.entry_debt_correction, market.market_state.entry_debt_correction_direction)
     }
 
     public fun funding_last_recomputed<B, Q>(market: &Market<B, Q>): u64 {
@@ -239,6 +243,7 @@ module perp::market_manager {
         (funding_entry.funding, funding_entry.direction)
     }
 
+    // TODO: push to this array somewhere?
     public fun get_position_addresses<B, Q>(market: &Market<B, Q>): &vector<address> {
         &market.market_state.position_addresses
     }
@@ -332,6 +337,10 @@ module perp::market_manager {
         market.market_settings.liquidation_premium_multiplier
     }
 
+    public fun oracle_price<B, Q>(market: &Market<B, Q>): u64 {
+        market.oracle.price
+    }
+
     /* //////////////////////////////////////////////////////////////
                     FRIEND FUNCTIONS (MUT REREFENCES)
     ////////////////////////////////////////////////////////////// */
@@ -388,8 +397,13 @@ module perp::market_manager {
         market.market_state.funding_rate_last_recomputed = funding_entry;
     }
 
-    public(friend) fun set_entry_debt_correction<B, Q>(market: &mut Market<B, Q>, entry_debt_correction: u64) {
+    public(friend) fun set_entry_debt_correction<B, Q>(
+        market: &mut Market<B, Q>,
+        entry_debt_correction: u64,
+        entry_debt_correction_direction: bool
+    ) {
         market.market_state.entry_debt_correction = entry_debt_correction;
+        market.market_state.entry_debt_correction_direction = entry_debt_correction_direction;
     }
 
     public(friend) fun set_market_skew<B, Q>(market: &mut Market<B, Q>, skew: u64, skew_direction: bool) {
@@ -434,11 +448,32 @@ module perp::market_manager {
     }
 
     public(friend) fun add_margin_to_vault<B, Q>(market: &mut Market<B, Q>, margin: Coin<Q>) {
-        balance::join(&mut market.vault.funds, coin::into_balance(margin));
+        coin::put<Q>(&mut market.vault.funds, margin);
     }
 
-    public(friend) fun pay_fee<B, Q>(market: &mut Market<B, Q>, fee: u64) {
-        market.vault.fees_outstanding = market.vault.fees_outstanding + fee;
+    public(friend) fun withdraw_margin_from_vault<B, Q>(market: &mut Market<B, Q>, margin: u64, ctx: &mut TxContext): Coin<Q> {
+        coin::take<Q>(&mut market.vault.funds, margin, ctx)
+    }
+
+    public(friend) fun add_to_cumulative_rewards<Q>(coin_amount: u64, vault: &mut Vault<Q>) {
+        //Get total vault shares
+        let shares = get_vault_shares(vault);
+
+        //Get vault cumulative rewards per share and use that to set updated calc for cumulative rewards per share
+        let cumulative_reward_per_share = get_vault_cumulative_rewards_per_share<Q>(vault);
+        set_vault_cumulative_rewards_per_share<Q>(vault, cumulative_reward_per_share + utils::divide_decimal(coin_amount, shares));
+
+        //Get vault outstanding fees and use that to set updated calc for outstanding fees
+        let fees_outstanding = get_vault_fees_outstanding<Q>(vault);
+        set_vault_fees_outstanding<Q>(vault, fees_outstanding + coin_amount);
+    }
+
+    // TODO: remove this
+    public(friend) fun set_oracle_price<B, Q>(
+        price: u64,
+        market: &mut Market<B, Q>
+    ) {
+        market.oracle.price = price;
     }
 
     /* //////////////////////////////////////////////////////////////
@@ -447,7 +482,7 @@ module perp::market_manager {
 
     // adds market for given base_asset (ex. ETH/BTC) and quote asset (ex. USDC)
     public entry fun add_market<B, Q>(
-        _oc: &OwnerCap,
+        oc: &OwnerCap,
         gm: &mut GlobalMarkets,
         ctx: &mut TxContext
     ) {
@@ -478,6 +513,7 @@ module perp::market_manager {
             market_skew: 0,
             skew_direction: true,
             entry_debt_correction: 0,
+            entry_debt_correction_direction: true,
             funding_last_recomputed: 0,
             funding_sequence: vector::empty<FundingEntry>(),
             funding_rate_last_recomputed: initial_funding_entry,
@@ -496,21 +532,47 @@ module perp::market_manager {
             funds: balance::zero<Q>(),
             shares: 0,
             cumulative_reward_per_share: 0,
+            utilization_mutliplier: 2,
             fees_outstanding: 0,
             stakes,
             rewards,
             can_user_stake: false,
-            max_capacity : 1000000,
-            staking_period : 100000
+            max_capacity : 1000000 * ONE_UNIT,
+            staking_period : 10000
+        };
+
+        // start the price at $2000. TODO: remove this
+        let price = 2000 * 1_000_000_000;
+        let oracle = Oracle<B> {
+            price
         };
 
         let market = Market<B, Q> {
             market_settings,
             market_state,
-            vault
+            vault,
+            oracle
         };
         bag::add(&mut gm.markets, market_name, market);
+
+        // set some default market parameters
+        // TODO delete when ready
+        set_market_parameters<B, Q>(oc, gm,
+            2 * ONE_UNIT, //min_keeper_fee (2)
+            1000 * ONE_UNIT, //max_keeper_fee (1000)
+            3500000, // liquidation_fee_ratio (.0035)
+            10000000, // liquidation_buffer_ratio (.01)
+            40 * ONE_UNIT, // min_initial_margin (40)
+            7500000, // taker_fee (.0075)
+            5000000, // maker_fee (.0050)
+            100 * ONE_UNIT, // max_leverage (100)
+            10_000 * ONE_UNIT, // max_market_value (10,000)
+            3 * ONE_UNIT, // max_funding_velocity (3)
+            1_000_000 * ONE_UNIT, // skew_scale (1,000,000)
+            100000000, // liquidation_premium_multiplier (.10)
+        );
     }
+    
 
     public entry fun set_market_parameters<B, Q>(
         _oc: &OwnerCap,
@@ -548,32 +610,48 @@ module perp::market_manager {
                 STAKE PUBLIC FUNCTIONS (NON-MUT REREFENCES)
     ////////////////////////////////////////////////////////////// */
 
-    public entry fun get_can_user_stake<B, Q>(gm: &GlobalMarkets) : bool {
-        let market = get_market<B, Q>(gm);
-        let vs = get_vault<B, Q>(market);
-        vs.can_user_stake
+    public fun can_user_stake<Q>(vault: &Vault<Q>) : bool {
+        vault.can_user_stake
     }
 
     public fun get_vault_funds<Q>(vault: &Vault<Q>): u64 {
         balance::value(&vault.funds)
     }
 
-    public fun get_user_amount_from_stakes(stakes: &Table<address,Stake>, addr : address) : u64 {
-        let userStake = table::borrow(stakes, addr);
-        userStake.amount
+    public fun get_vault_max_capacity<Q>(vault: &Vault<Q>): u64 {
+        vault.max_capacity
     }
 
-    public fun get_user_shares_from_stakes(stakes: &Table<address,Stake>, addr : address) : u64 {
-        let userStake = table::borrow(stakes, addr);
-        userStake.shares
+    public fun get_vault_staking_period<Q>(vault: &Vault<Q>): u64 {
+        vault.staking_period
     }
 
-    public entry fun get_user_shares_from_stakes_from_gm<B, Q>(gm: &GlobalMarkets, addr : address) : u64 {
-        let market = get_market<B, Q>(gm);
-        let vault = get_vault<B, Q>(market);
-        let stakes = get_vault_stakes<Q>(vault);
-        let userStake = table::borrow(stakes, addr);
-        userStake.shares
+    public fun get_user_amount_from_stakes(stakes: &Table<address,Stake>, addr: address) : u64 {
+        let user_stake = table::borrow(stakes, addr);
+        user_stake.amount
+    }
+
+    public fun get_user_shares_from_stakes(stakes: &Table<address,Stake>, addr: address) : u64 {
+        let user_stake = table::borrow(stakes, addr);
+        user_stake.shares
+    }
+
+    public fun get_timestamp_from_user_stake(user_stake: &Stake) : u64 {
+        user_stake.timestamp
+    }
+
+    public fun vault_parameters<Q>(vault: &Vault<Q>):
+        (u64, u64, u64, u64, bool, u64, u64, u64) {
+        (
+            balance::value(&vault.funds),
+            vault.shares,
+            vault.cumulative_reward_per_share,
+            vault.fees_outstanding,
+            vault.can_user_stake,
+            vault.utilization_mutliplier,
+            vault.max_capacity,
+            vault.staking_period
+        )
     }
        
     public fun get_shares_in_user_stake(user_stake: &Stake) : u64 {
@@ -585,14 +663,14 @@ module perp::market_manager {
     }
 
     public fun get_user_stake(stakes: &Table<address,Stake>, addr : address) : &Stake {
-        let userStake = table::borrow(stakes, addr);
-        userStake
+        let user_stake = table::borrow(stakes, addr);
+        user_stake
     }
 
     public fun get_user_reward_info<Q>(vault: &Vault<Q>, addr : address) : &RewardInfo {
         let rewards = &vault.rewards;
-        let rewardInfo = table::borrow(rewards, addr);
-        rewardInfo
+        let reward_info = table::borrow(rewards, addr);
+        reward_info
     }
 
     public fun get_user_reward_claimable_reward(reward_info: &RewardInfo) : u64 {
@@ -637,12 +715,12 @@ module perp::market_manager {
                     STAKE FRIEND FUNCTIONS (MUT REREFENCES)
     ////////////////////////////////////////////////////////////// */
 
-    public(friend) fun create_stake(owner: address, amount: u64, shares: u64) : Stake {
+    public(friend) fun create_stake(owner: address, amount: u64, shares: u64, timestamp: u64) : Stake {
         let stake = Stake {
             owner,
             amount,
             shares,
-            timestamp: 10000,
+            timestamp
         };
         stake
     }
@@ -657,6 +735,10 @@ module perp::market_manager {
     
     public(friend) fun get_vault_funds_mut<Q>(vault: &mut Vault<Q>): &mut Balance<Q> {
         &mut vault.funds
+    }
+
+    public fun get_vault_utilization_multiplier<Q>(vault: &Vault<Q>): u64 {
+        vault.utilization_mutliplier
     }
 
     public fun get_user_stake_mut(stakes: &mut Table<address,Stake>, addr : address) : &mut Stake {
@@ -686,6 +768,10 @@ module perp::market_manager {
 
     public fun set_shares_in_user_stake(user_stake: &mut Stake, val: u64) {
         user_stake.shares = val;
+    }
+
+    public fun set_timestamp_in_user_stake(user_stake: &mut Stake, val: u64) {
+        user_stake.timestamp = val;
     }
 
     public fun set_amount_in_user_stake(user_stake: &mut Stake, val: u64) {
@@ -722,6 +808,15 @@ module perp::market_manager {
     /// Wrapper of module initializer for testing
     public fun test_init(ctx: &mut TxContext) {
         init_helper(ctx);
+    }
+
+    #[test_only]
+    public fun set_oracle_price_test<B, Q>(
+        price: u64,
+        gm: &mut GlobalMarkets
+    ) {
+        let market = get_market_mut<B, Q>(gm);
+        set_oracle_price(price, market);
     }
 
 }
